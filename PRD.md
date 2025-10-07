@@ -1,4 +1,4 @@
-# **🧱 BlockETF 项目需求文档（BNB Chain + Solidity 版）**
+# **BlockETF 项目需求文档（BNB Chain + Solidity 版）**
 
 ## **一、产品概述**
 
@@ -464,3 +464,238 @@ classDef oracle fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px;
 classDef token fill:#fce4ec,stroke:#d81b60,stroke-width:2px;
 classDef asset fill:#f1f8e9,stroke:#558b2f,stroke-width:2px;
 ```
+
+# rebalance 设计
+
+Rebalance（再平衡）是指：
+
+> 定期或基于触发条件调整 ETF 内各资产的权重，使之恢复到目标配置比例。
+
+例如：
+
+> BlockETF 目标权重：BTC 50%，ETH 30%，BNB 20%
+
+> 若实际权重偏离目标超过阈值，就通过 Swap 调整持仓。
+
+```mermaid
+graph TD
+    %% 参与者
+    U[用户/前端] --> M[ETFManager<br/>上层业务合约]
+    K[Keeper/定时器] --> M
+
+    %% Rebalance执行流程
+    M -->|触发| RE[RebalanceExecutor<br/>策略执行器]
+    RE -->|查询价格| PO[PriceOracle<br/>价格预言机]
+    PO -->|返回价格| RE
+    RE -->|计算交易量| CR[计算模块]
+    CR -->|买卖指令| RE
+
+    %% DEX交互
+    RE -->|执行Swap| PS[PancakeSwap Router<br/>去中心化交易所]
+    PS -->|返回实际成交| RE
+    RE -->|提交最终余额| B[BlockETF<br/>底层核心合约]
+
+    %% 底层核心合约内部结构
+    B -->|更新资产配置| CV[配置校验器]
+    CV -->|校验通过| AP[资产池<br/>BNB/USDT/ETH等]
+    B -->|管理份额| T[ERC20份额代币]
+
+    %% 事件和监控
+    B -->|发射Rebalance事件| EL[事件日志]
+    RE -->|发射Swap事件| EL
+
+    %% 架构分层
+    subgraph 业务逻辑层 [可升级的业务逻辑层]
+        M
+        RE
+        CR
+        PS
+        PO
+    end
+
+    subgraph 核心资产层 [不可变的资产安全层]
+        B
+        CV
+        AP
+        T
+    end
+
+    subgraph 监控层 [监控和审计]
+        EL
+    end
+
+    %% 样式定义
+    U:::user
+    K:::keeper
+    M:::manager
+    RE:::executor
+    PO:::oracle
+    PS:::dex
+    B:::vault
+    CV:::validator
+    AP:::asset
+    T:::token
+    EL:::event
+
+    classDef user fill:#e0f7fa,stroke:#00acc1,stroke-width:2px;
+    classDef keeper fill:#fff3e0,stroke:#ff9800,stroke-width:2px;
+    classDef manager fill:#e8f5e9,stroke:#43a047,stroke-width:2px;
+    classDef executor fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px;
+    classDef oracle fill:#e1bee7,stroke:#7b1fa2,stroke-width:2px;
+    classDef dex fill:#ede7f6,stroke:#5e35b1,stroke-width:2px;
+    classDef vault fill:#fff3e0,stroke:#fb8c00,stroke-width:2px;
+    classDef validator fill:#ffebee,stroke:#e53935,stroke-width:2px;
+    classDef asset fill:#f1f8e9,stroke:#558b2f,stroke-width:2px;
+    classDef token fill:#fce4ec,stroke:#d81b60,stroke-width:2px;
+    classDef event fill:#e0f2f1,stroke:#00695c,stroke-width:2px;
+```
+
+## 🔧 核心校验逻辑（BlockETF 内部）
+
+```solidity
+// BlockETF.sol - 核心校验机制
+function submitRebalance(
+    address[] calldata assets,
+    uint256[] calldata newBalances,
+    uint256 expectedTotalValue
+) external onlyManager {
+    // 1. 总额校验
+    uint256 actualTotalValue = calculateTotalValue(assets);
+    require(actualTotalValue >= expectedTotalValue * 99 / 100, "Value mismatch");
+
+    // 2. 偏差校验
+    for(uint i = 0; i < assets.length; i++) {
+        uint256 targetWeight = targetWeights[assets[i]];
+        uint256 actualWeight = newBalances[i] * 1e18 / actualTotalValue;
+        uint256 deviation = absDiff(actualWeight, targetWeight);
+        require(deviation <= maxDeviation, "Deviation exceeded");
+    }
+
+    // 3. 更新状态
+    for(uint i = 0; i < assets.length; i++) {
+        assetBalances[assets[i]] = newBalances[i];
+    }
+
+    // 4. 累积管理费
+    accumulateManagementFee();
+
+    emit Rebalanced(assets, newBalances, actualTotalValue);
+}
+```
+
+## 📊 数据流验证
+
+| 阶段         | 输入           | 处理         | 输出     | 安全校验           |
+| ------------ | -------------- | ------------ | -------- | ------------------ |
+| **策略计算** | 当前价格、持仓 | 计算目标权重 | 买卖指令 | 价格来源可信       |
+| **DEX 执行** | 买卖指令       | 执行 Swap    | 实际成交 | 滑点控制           |
+| **结果提交** | 新余额数组     | 校验逻辑     | 状态更新 | 总额一致、偏差合规 |
+
+## 🛡️ 安全边界
+
+1. **核心层不可变** - BlockETF 逻辑固定，资产安全
+2. **策略层可升级** - Rebalance 逻辑可优化替换
+3. **结果校验** - 只接受合规的资产配置
+4. **权限分离** - 执行权 ≠ 资产控制权
+
+该设计确保了即使上层合约被攻击，底层资产也不会被非法转移，真正实现了"核心资产安全"与"业务逻辑灵活"的完美平衡。
+
+# router 合约设计
+
+## MVP 功能
+
+- **单一入口** ：只支持 USDT
+- **目标资产** ：BTCB、ETH、XRP、SOL、WBNB
+- **核心函数** ：`mintWithUSDT()` 和 `burnToUSDT()`
+- **滑点保护** ：避免用户损失
+- **DEX 集成** ：先用 PancakeSwap 做流动性入口
+
+## PancakeSwap 版本选择
+
+- BTCB/ETH/XRP/SOL：V3 更好
+- WBNB：只在 V2 有流动性
+
+因此采用了 **V2+V3 混合架构**
+
+| **特性**         | **V2**                     | **V3**                                  |
+| ---------------- | -------------------------- | --------------------------------------- |
+| **流动性模式**   | 常规恒定乘积 AMM（x\*y=k） | 集中流动性 (Concentrated Liquidity)     |
+| **价格范围**     | 整个价格区间               | 可自定义价格区间（提高资本效率）        |
+| **手续费灵活性** | 固定                       | 可选不同费率档位（0.05%, 0.25%, 1%）    |
+| **适用资产**     | 所有交易对均可创建流动性   | 对于流动性较低或小币种，可能没有足够 LP |
+| **滑点**         | 较大                       | 资本利用率高，滑点小（集中流动性）      |
+
+### **不同资产流动性分布差异**
+
+- **BTCB / ETH / XRP / SOL**
+  - 是 PancakeSwap 上流动性较高的资产，且用户和 LP 集中在价格特定区间
+  - 使用 **V3 集中流动性** 可以极大降低滑点，提高资本效率
+- **WBNB**
+  - 是 BSC 上最基础、交易量最大的资产
+  - V3 上 WBNB 对 USDT/BUSD/其他稳定币的 LP 极少甚至不存在
+  - 反而在 **V2 池里流动性充足**，滑点更低，交易成本更可控
+
+### 原因总结
+
+1. **V3 流动性池存在分布不均问题**
+   - 流动性提供者（LP）选择集中在特定价格区间
+   - 对一些资产，如果 LP 没有在你需要的价格区间提供流动性，就无法成交或滑点大
+2. **V2 是全区间流动性**
+   - 恒定乘积 AMM，整个价格区间都有流动性
+   - 对 WBNB 这种高频交易、全链基础币来说，V2 流动性比 V3 高
+3. **交易滑点和执行成本**
+   - 对大额交易或 ETF rebalance，需要保证成交量和低滑点
+   - 采用 V2 处理 WBNB 可降低滑点风险
+   - 对 BTCB/ETH/XRP/SOL，用 V3 提高资本利用率，减少 LP 成本
+
+![img](https://i.urusai.cc/7QQcJ.png)
+
+## 路由策略
+
+- 有配置的池就走配置池
+- 没有配置则走默认直换
+
+## 费率配置
+
+直接配置池地址
+
+## 混合 `DEX`配置
+
+- WBNB：走 V2
+- 其他：走 V3
+
+> Router 内部做了自动判断，用户无感知。
+
+## 实现要点
+
+```solidity
+function mintWithUSDT(...) external returns (uint256 shares);
+function burnToUSDT(...) external returns (uint256 usdtAmount);
+```
+
+- **申购** ：用户给 USDT → Router 拆分兑换成目标资产 → 调用 Core 铸造份额 → 返回多余 USDT
+- **赎回** ：用户交回份额 → Core 退回底层资产 → Router 换回 USDT → 转给用户
+
+这中间的优化点在于：
+
+- 用 `<span leaf="">mintExactShares</span>` 来提高精度
+- 支持管理员灵活配置池和滑点参数
+- 保留紧急暂停功能
+
+## 最终架构
+
+最终架构大致是这样的：
+
+```bash
+USDT <——> Router <——> Core
+             │
+             ├─ PancakeSwap V2 (WBNB)
+             └─ PancakeSwap V3 (BTCB/ETH/XRP/SOL)
+```
+
+它的特性包括：
+
+- 智能路由，自动走最优路径
+- V2+V3 混合，充分利用流动性
+- 精确份额控制，减少滑点
+- 灵活配置，可快速调整
